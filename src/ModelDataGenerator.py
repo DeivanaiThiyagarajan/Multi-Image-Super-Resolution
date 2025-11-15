@@ -26,6 +26,7 @@ def load_correct_study(patient_path):
 def load_patient_volume(patient_folder):
 
     study_folder = load_correct_study(patient_folder)
+    print(study_folder)
     if study_folder is None:
         return None
 
@@ -45,7 +46,7 @@ def load_patient_volume(patient_folder):
 
     # Stack into a volume (Z,H,W)
     volume_np = np.stack(slices, axis=0)
-    
+
     return volume_np
 
 def generate_consecutive_triplets(volume):
@@ -58,15 +59,27 @@ def generate_consecutive_triplets(volume):
 
     # Distance 2
     for i in range(volume.shape[0] - 2):
-        pre.append(volume[i])
-        post.append(volume[i + 2])
-        mid.append(volume[i + 1])
+        pre_slice = (volume[i] - volume[i].mean()) / (volume[i].std()+1e-6)
+        mid_slice = (volume[i+1] - volume[i+1].mean()) / (volume[i+1].std()+1e-6)
+        post_slice = (volume[i+2] - volume[i+2].mean()) / (volume[i+2].std()+1e-6)
+        pre_slice  = torch.tensor(pre_slice).unsqueeze(0)
+        mid_slice  = torch.tensor(mid_slice).unsqueeze(0)
+        post_slice = torch.tensor(post_slice).unsqueeze(0)
+        pre.append(pre_slice)
+        post.append(post_slice)
+        mid.append(mid_slice)
 
     # Distance 4
     for i in range(volume.shape[0] - 4):
-        pre.append(volume[i])
-        post.append(volume[i + 4])
-        mid.append(volume[i + 2])
+        pre_slice = (volume[i] - volume[i].mean()) / (volume[i].std()+1e-6)
+        mid_slice = (volume[i+1] - volume[i+2].mean()) / (volume[i+2].std()+1e-6)
+        post_slice = (volume[i+4] - volume[i+4].mean()) / (volume[i+4].std()+1e-6)
+        pre_slice  = torch.tensor(pre_slice).unsqueeze(0)
+        mid_slice  = torch.tensor(mid_slice).unsqueeze(0)
+        post_slice = torch.tensor(post_slice).unsqueeze(0)
+        pre.append(pre_slice)
+        post.append(post_slice)
+        mid.append(mid_slice)
 
     return pre, post, mid
 
@@ -99,44 +112,31 @@ class PairedTransforms:
 
 class TripletSliceDataset(Dataset):
     def __init__(self, patient_folders, transform=None):
-        self.patient_folders = [f for f in patient_folders if self.load_volume(f) is not None]  # only folder paths
-        print(len(self.patient_folders), "valid patient folders found.")
         self.transform = transform
+        self.triplets = []  # will store (pre, post, target) slices
+        
+        for folder in patient_folders:
+            vol = load_patient_volume(folder)
+            if vol is None:
+                continue
+
+            pre_list, post_list, mid_list = generate_consecutive_triplets(vol)
+            for pre, post, mid in zip(pre_list, post_list, mid_list):
+                self.triplets.append((pre, post, mid))
+        
+        print(len(self.triplets), "triplets found across all patients")
 
     def __len__(self):
-        return len(self.patient_folders)
-
-    def load_volume(self, folder):
-        vol = load_patient_volume(folder)  # load volume on-the-fly
-        return vol
+        return len(self.triplets)
 
     def __getitem__(self, idx):
-        folder = self.patient_folders[idx]
-        vol = self.load_volume(folder)  # (Z,H,W)
-        
-        # Select random triplet inside this volume
-        i = np.random.randint(0, vol.shape[0]-2)
-        pre = vol[i]
-        mid = vol[i+1]
-        post = vol[i+2]
-
-        # Normalize slices
-        pre = (pre - pre.mean()) / (pre.std()+1e-6)
-        mid = (mid - mid.mean()) / (mid.std()+1e-6)
-        post = (post - post.mean()) / (post.std()+1e-6)
-
-        # Convert to tensors
-        pre  = torch.tensor(pre).unsqueeze(0)
-        mid  = torch.tensor(mid).unsqueeze(0)
-        post = torch.tensor(post).unsqueeze(0)
-
+        pre, post, mid = self.triplets[idx]
         sample = {"pre": pre, "post": post, "target": mid}
 
         if self.transform:
             sample = self.transform(sample)
 
         return (sample["pre"], sample["post"]), sample["target"]
-
 
 def build_dataloader(split="train",
                      batch_size=4,
@@ -176,22 +176,13 @@ def build_dataloader(split="train",
     # ---------------------------------------------------------
     # Read patient volumes + generate triplets
     # ---------------------------------------------------------
-
-    all_pre, all_post, all_mid = [], [], []
-
+    patient_folders = []
     for pid in folders:
-        vol = load_patient_volume(os.path.join(BASE_DIR, pid))
-        if vol is None:
-            continue
-
-        pre, post, mid = generate_consecutive_triplets(vol)
-        all_pre.extend(pre)
-        all_post.extend(post)
-        all_mid.extend(mid)
+        patient_folders.append(os.path.join(BASE_DIR, pid))
 
     transform = PairedTransforms() if augment else None
 
-    dataset = TripletSliceDataset(folders, transform)
+    dataset = TripletSliceDataset(patient_folders, transform)
 
     # ---------------------------------------------------------
     # Build DataLoader
